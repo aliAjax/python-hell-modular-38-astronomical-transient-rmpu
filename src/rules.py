@@ -1,11 +1,65 @@
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
 
 
+# Quality gates applied when an operator submits the follow-up observation result.
+# cloud cover is a fraction in [0, 1]; seeing and tracking error are arcseconds;
+# the limiting magnitude must be deep enough (larger value = fainter reach).
+QUALITY_LIMITS = {
+    "cloud_cover": {"constraint": "max", "value": 0.30},
+    "seeing_arcsec": {"constraint": "max", "value": 2.0},
+    "tracking_error_arcsec": {"constraint": "max", "value": 1.5},
+    "limiting_magnitude": {"constraint": "min", "value": 19.0},
+}
+
+
 def _find_one(lookup, kind, field, value):
     if lookup is None:
         return None
     rows = lookup(kind, field, value) or []
     return rows[0] if rows else None
+
+
+def _metric_number(data, field, minimum, minimum_inclusive=True, maximum=None):
+    try:
+        number = float(data.get(field))
+    except (TypeError, ValueError):
+        raise ValidationError("%s must be numeric" % field)
+    if minimum is not None and (number < minimum or (not minimum_inclusive and number == minimum)):
+        raise ValidationError("%s must be %s %s" % (field, ">=" if minimum_inclusive else ">", minimum))
+    if maximum is not None and number > maximum:
+        raise ValidationError("%s must be <= %s" % (field, maximum))
+    return number
+
+
+def evaluate_observation_quality(data):
+    """Evaluate operator submitted metrics against the quality gates."""
+    metrics = {
+        "cloud_cover": _metric_number(data, "cloud_cover", 0.0, maximum=1.0),
+        "seeing_arcsec": _metric_number(data, "seeing_arcsec", 0.0, minimum_inclusive=False),
+        "tracking_error_arcsec": _metric_number(data, "tracking_error_arcsec", 0.0),
+        "limiting_magnitude": _metric_number(data, "limiting_magnitude", 0.0, maximum=30.0),
+    }
+    reasons = []
+    for field, rule in QUALITY_LIMITS.items():
+        value = metrics[field]
+        exceeded = value > rule["value"] if rule["constraint"] == "max" else value < rule["value"]
+        if exceeded:
+            relation = "exceeds maximum" if rule["constraint"] == "max" else "is shallower than minimum"
+            reasons.append(
+                {
+                    "metric": field,
+                    "value": value,
+                    "constraint": rule["constraint"],
+                    "limit": rule["value"],
+                    "message": "%s=%s %s %s" % (field, value, relation, rule["value"]),
+                }
+            )
+    return {
+        "metrics": metrics,
+        "limits": {field: rule["value"] for field, rule in QUALITY_LIMITS.items()},
+        "reasons": reasons,
+        "passed": not reasons,
+    }
 
 
 def calculate_priority(magnitude, transient_type):
@@ -72,14 +126,61 @@ def _validate_telescope(actor, data, lookup):
     return {}
 
 
+def _candidate_has_archived_result(lookup, candidate_id):
+    """Return the archived qualified observation for a candidate, if any."""
+    if lookup is None or not candidate_id:
+        return None
+    for observation in lookup("observation", "candidate_id", candidate_id) or []:
+        if observation["status"] == "archived":
+            return observation
+    return None
+
+
+def _ensure_no_archived_result(lookup, candidate_id):
+    archived = _candidate_has_archived_result(lookup, candidate_id)
+    if archived:
+        raise ConflictError(
+            "candidate %s already has a usable archived result %s"
+            % (candidate_id, archived["id"])
+        )
+
+
 def _validate_observation(actor, data, lookup):
-    if not _find_one(lookup, "candidate", "id", data.get("candidate_id")):
+    candidate_id = data.get("candidate_id")
+    if not _find_one(lookup, "candidate", "id", candidate_id):
         raise ValidationError("candidate does not exist")
     if not _find_one(lookup, "telescope", "id", data.get("telescope_id")):
         raise ValidationError("telescope does not exist")
     if str(data.get("start_at")) >= str(data.get("end_at")):
         raise ValidationError("observation end must be after start")
-    return {"scheduled_team": data.get("team_id")}
+    reobservation_id = data.get("reobservation_id")
+    if reobservation_id is not None and not isinstance(reobservation_id, str):
+        raise ValidationError("reobservation_id must be a string")
+    reobservation_id = (reobservation_id or "").strip() or None
+    if reobservation_id:
+        todo = _find_one(lookup, "reobservation", "id", reobservation_id)
+        if not todo:
+            raise ValidationError("reobservation todo does not exist")
+        if todo["data"].get("candidate_id") != candidate_id:
+            raise ValidationError("reobservation todo belongs to another candidate")
+        if todo["status"] in ("resolved", "cancelled"):
+            raise InvalidTransition("reobservation todo %s is %s" % (reobservation_id, todo["status"]))
+        # A follow-up created for another todo already covers this request.
+        follow_up_id = todo["data"].get("follow_up_observation_id")
+        if follow_up_id:
+            follow_up = _find_one(lookup, "observation", "id", follow_up_id)
+            if follow_up and follow_up["status"] not in ("withdrawn",):
+                raise ConflictError(
+                    "reobservation todo %s already has follow-up observation %s"
+                    % (reobservation_id, follow_up_id)
+                )
+    # A candidate with a qualified archived result must not consume more
+    # telescope / observing-team time.
+    _ensure_no_archived_result(lookup, candidate_id)
+    return {
+        "scheduled_team": data.get("team_id"),
+        **({"reobservation_id": reobservation_id} if reobservation_id else {}),
+    }
 
 
 def _validate_merge_measurement(actor, entity, data, lookup):
@@ -123,6 +224,13 @@ def _validate_correct(actor, entity, data, lookup):
 
 
 def _validate_schedule(actor, entity, data, lookup):
+    candidate_id = entity["data"].get("candidate_id")
+    archived = _candidate_has_archived_result(lookup, candidate_id)
+    if archived and archived["id"] != entity["id"]:
+        raise ConflictError(
+            "candidate %s already has a usable archived result %s; refusing to occupy telescope time"
+            % (candidate_id, archived["id"])
+        )
     observations = lookup("observation", "telescope_id", entity["data"].get("telescope_id")) if lookup else []
     for other in observations:
         if other["id"] == entity["id"] or other["status"] != "scheduled":
@@ -148,18 +256,98 @@ def _validate_schedule(actor, entity, data, lookup):
     return {"scheduled_by": actor.user_id}
 
 
+def _validate_complete(actor, entity, data, lookup):
+    evaluation = evaluate_observation_quality(data)
+    if evaluation["passed"]:
+        return {
+            "quality": evaluation,
+            "quality_submitted_by": actor.user_id,
+            "__next_status__": "review_pending",
+        }
+    archived = _candidate_has_archived_result(lookup, entity["data"].get("candidate_id"))
+    return {
+        "quality": evaluation,
+        "quality_submitted_by": actor.user_id,
+        "quality_archived_result_exists": bool(archived),
+        "quality_archived_result_id": archived["id"] if archived else None,
+        "__next_status__": "needs_reobservation",
+    }
+
+
+def _validate_review(actor, entity, data, lookup):
+    decision = data.get("decision")
+    if decision not in ("approve", "reject"):
+        raise ValidationError("decision must be approve or reject")
+    if decision == "approve" and entity["status"] != "review_pending":
+        raise InvalidTransition(
+            "only pending reviews with passing quality can be approved for archival"
+        )
+    patch = {
+        "reviewed_by": actor.user_id,
+        "review_decision": decision,
+        "__next_status__": "archived" if decision == "approve" else "needs_reobservation",
+    }
+    if decision == "reject":
+        if not str(data.get("reason", "")).strip():
+            raise ValidationError("rejection reason is required")
+        previous_quality = entity["data"].get("quality") or {}
+        review_reason = {
+            "metric": "review",
+            "constraint": "review",
+            "value": None,
+            "limit": None,
+            "message": str(data.get("reason", "")).strip(),
+        }
+        reasons = list(previous_quality.get("reasons") or [])
+        if not any(item.get("metric") == "review" for item in reasons):
+            reasons.append(review_reason)
+        patch["quality"] = {
+            **previous_quality,
+            "passed": False,
+            "reasons": reasons,
+            "review_reason": review_reason["message"],
+        }
+    return patch
+
+
+def _validate_reobservation(actor, data, lookup):
+    candidate_id = data.get("candidate_id")
+    if not _find_one(lookup, "candidate", "id", candidate_id):
+        raise ValidationError("candidate does not exist")
+    source_observation_id = data.get("source_observation_id")
+    if source_observation_id:
+        source = _find_one(lookup, "observation", "id", source_observation_id)
+        if not source:
+            raise ValidationError("source observation does not exist")
+        if source["data"].get("candidate_id") != candidate_id:
+            raise ValidationError("source observation belongs to another candidate")
+    reasons = data.get("reasons")
+    if not isinstance(reasons, list) or not reasons:
+        raise ValidationError("reobservation reasons are required")
+    _ensure_no_archived_result(lookup, candidate_id)
+    return {"origin": data.get("origin", "manual"), "created_by_user": actor.user_id}
+
+
+def _validate_cancel_reobservation(actor, entity, data, lookup):
+    if not str(data.get("reason", "")).strip():
+        raise ValidationError("cancellation reason is required")
+    return {"cancelled_by": actor.user_id}
+
+
 class RuleEngine:
     ALIASES = {
         "sources": "source",
         "candidates": "candidate",
         "telescopes": "telescope",
         "observations": "observation",
+        "reobservations": "reobservation",
     }
     INITIAL_STATUS = {
         "source": "registered",
         "candidate": "detected",
         "telescope": "available",
         "observation": "requested",
+        "reobservation": "open",
     }
     TRANSITIONS = {
         "source": {
@@ -180,9 +368,15 @@ class RuleEngine:
         },
         "observation": {
             "schedule": (("requested",), "scheduled"),
-            "complete": (("scheduled",), "completed"),
+            "complete": (("scheduled",), "__dynamic__"),
+            "review": (("review_pending", "needs_reobservation"), "__dynamic__"),
             "withdraw": (("requested", "scheduled"), "withdrawn"),
             "correct": (("requested", "scheduled"), "requested"),
+        },
+        "reobservation": {
+            "mark_scheduled": (("open",), "scheduled"),
+            "resolve": (("open", "scheduled"), "resolved"),
+            "cancel": (("open", "scheduled"), "cancelled"),
         },
     }
     CREATE_REQUIRED = {
@@ -190,6 +384,7 @@ class RuleEngine:
         "candidate": ("source_id", "event_id", "ra", "dec", "magnitude", "transient_type", "observed_at"),
         "telescope": ("name", "aperture_m", "site_name"),
         "observation": ("candidate_id", "telescope_id", "team_id", "start_at", "end_at", "mode"),
+        "reobservation": ("candidate_id", "reasons"),
     }
     ACTION_REQUIRED = {
         ("source", "retire"): ("reason",),
@@ -201,41 +396,58 @@ class RuleEngine:
         ("candidate", "classify"): ("classification",),
         ("telescope", "restrict"): ("reason",),
         ("observation", "schedule"): ("operator_id",),
+        ("observation", "complete"): (
+            "cloud_cover",
+            "seeing_arcsec",
+            "limiting_magnitude",
+            "tracking_error_arcsec",
+        ),
+        ("observation", "review"): ("decision",),
         ("observation", "withdraw"): ("reason",),
         ("observation", "correct"): ("reason",),
+        ("reobservation", "cancel"): ("reason",),
     }
     CREATE_ROLES = {
         "source": ("analyst", "admin"),
         "candidate": ("analyst", "operator", "admin"),
         "telescope": ("coordinator", "admin"),
         "observation": ("analyst", "coordinator", "admin"),
+        "reobservation": ("coordinator", "supervisor", "admin"),
     }
     ROLE_ACTIONS = {
-        "activate": ("coordinator", "admin"),
-        "retire": ("coordinator", "admin"),
-        "merge_measurement": ("analyst", "operator", "admin"),
-        "triage": ("analyst", "operator", "admin"),
-        "reclassify": ("analyst", "supervisor", "admin"),
-        "correct": ("analyst", "supervisor", "admin"),
-        "withdraw": ("analyst", "supervisor", "admin"),
-        "classify": ("analyst", "supervisor", "admin"),
-        "restrict": ("coordinator", "admin"),
-        "restore": ("coordinator", "admin"),
-        "schedule": ("coordinator", "admin"),
-        "complete": ("operator", "coordinator", "admin"),
+        ("source", "activate"): ("coordinator", "admin"),
+        ("source", "retire"): ("coordinator", "admin"),
+        ("candidate", "merge_measurement"): ("analyst", "operator", "admin"),
+        ("candidate", "triage"): ("analyst", "operator", "admin"),
+        ("candidate", "reclassify"): ("analyst", "supervisor", "admin"),
+        ("candidate", "correct"): ("analyst", "supervisor", "admin"),
+        ("candidate", "withdraw"): ("analyst", "supervisor", "admin"),
+        ("candidate", "classify"): ("analyst", "supervisor", "admin"),
+        ("telescope", "restrict"): ("coordinator", "admin"),
+        ("telescope", "restore"): ("coordinator", "admin"),
+        ("observation", "schedule"): ("coordinator", "admin"),
+        ("observation", "complete"): ("operator", "coordinator", "admin"),
+        ("observation", "review"): ("supervisor", "admin"),
+        ("reobservation", "mark_scheduled"): ("coordinator", "operator", "admin"),
+        ("reobservation", "resolve"): ("supervisor", "admin"),
+        ("reobservation", "cancel"): ("coordinator", "supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "source": _validate_source,
         "candidate": _validate_candidate,
         "telescope": _validate_telescope,
         "observation": _validate_observation,
+        "reobservation": _validate_reobservation,
     }
     CUSTOM_TRANSITIONS = {
         ("candidate", "merge_measurement"): _validate_merge_measurement,
         ("candidate", "reclassify"): _validate_reclassify,
         ("candidate", "correct"): _validate_correct,
         ("observation", "schedule"): _validate_schedule,
+        ("observation", "complete"): _validate_complete,
+        ("observation", "review"): _validate_review,
         ("observation", "correct"): _validate_correct,
+        ("reobservation", "cancel"): _validate_cancel_reobservation,
     }
 
     def normalize_kind(self, kind):
@@ -283,5 +495,12 @@ class RuleEngine:
         extra = custom(actor, entity, data, lookup) if custom else {}
         patch = dict(data)
         if extra:
+            dynamic_status = extra.pop("__next_status__", None)
             patch.update(extra)
+        else:
+            dynamic_status = None
+        if next_status == "__dynamic__":
+            next_status = dynamic_status
+            if not next_status:
+                raise InvalidTransition("action %s did not resolve a target status" % action)
         return next_status, patch

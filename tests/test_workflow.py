@@ -77,9 +77,24 @@ class WorkflowTest(unittest.TestCase):
             coordinator, observation["id"], "schedule", {"operator_id": "op-1"}
         )
         observation = self.service.transition(
-            Actor("operator-1", "operator"), observation["id"], "complete", {"quality": "good"}
+            Actor("operator-1", "operator"),
+            observation["id"],
+            "complete",
+            {
+                "cloud_cover": 0.1,
+                "seeing_arcsec": 1.1,
+                "limiting_magnitude": 20.5,
+                "tracking_error_arcsec": 0.4,
+            },
         )
-        self.assertEqual(observation["status"], "completed")
+        self.assertEqual(observation["status"], "review_pending")
+        observation = self.service.transition(
+            Actor("supervisor-1", "supervisor"),
+            observation["id"],
+            "review",
+            {"decision": "approve"},
+        )
+        self.assertEqual(observation["status"], "archived")
         self.assertTrue(self.service.audit_log(observation["id"]))
 
 
