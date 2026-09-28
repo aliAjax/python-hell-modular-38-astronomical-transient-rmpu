@@ -1,5 +1,19 @@
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
 
+QUALITY_METRIC_FIELDS = (
+    "cloud_cover_pct",
+    "seeing_arcsec",
+    "limiting_magnitude",
+    "tracking_error_arcsec",
+)
+
+DEFAULT_QUALITY_LIMITS = {
+    "max_cloud_cover_pct": 30.0,
+    "max_seeing_arcsec": 2.5,
+    "min_limiting_magnitude": 18.0,
+    "max_tracking_error_arcsec": 1.0,
+}
+
 
 def _find_one(lookup, kind, field, value):
     if lookup is None:
@@ -79,6 +93,16 @@ def _validate_observation(actor, data, lookup):
         raise ValidationError("telescope does not exist")
     if str(data.get("start_at")) >= str(data.get("end_at")):
         raise ValidationError("observation end must be after start")
+    archived = [
+        item
+        for item in (lookup("observation", "candidate_id", data.get("candidate_id")) if lookup else [])
+        if item["status"] == "archived"
+    ]
+    if archived:
+        raise ConflictError(
+            "candidate already has a qualified archived observation: %s; "
+            "re-observation would re-occupy telescope and team time" % archived[0]["id"]
+        )
     return {"scheduled_team": data.get("team_id")}
 
 
@@ -181,6 +205,8 @@ class RuleEngine:
         "observation": {
             "schedule": (("requested",), "scheduled"),
             "complete": (("scheduled",), "completed"),
+            "submit_quality": (("completed",), "quality_passed"),
+            "archive": (("quality_passed",), "archived"),
             "withdraw": (("requested", "scheduled"), "withdrawn"),
             "correct": (("requested", "scheduled"), "requested"),
         },
@@ -201,6 +227,7 @@ class RuleEngine:
         ("candidate", "classify"): ("classification",),
         ("telescope", "restrict"): ("reason",),
         ("observation", "schedule"): ("operator_id",),
+        ("observation", "submit_quality"): QUALITY_METRIC_FIELDS,
         ("observation", "withdraw"): ("reason",),
         ("observation", "correct"): ("reason",),
     }
@@ -223,6 +250,8 @@ class RuleEngine:
         "restore": ("coordinator", "admin"),
         "schedule": ("coordinator", "admin"),
         "complete": ("operator", "coordinator", "admin"),
+        "submit_quality": ("operator", "coordinator", "admin"),
+        "archive": ("operator", "coordinator", "supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "source": _validate_source,
@@ -237,6 +266,67 @@ class RuleEngine:
         ("observation", "schedule"): _validate_schedule,
         ("observation", "correct"): _validate_correct,
     }
+
+    def __init__(self, quality_limits=None):
+        self.quality_limits = dict(DEFAULT_QUALITY_LIMITS)
+        if quality_limits:
+            self.quality_limits.update(quality_limits)
+        self.CUSTOM_TRANSITIONS = dict(self.CUSTOM_TRANSITIONS)
+        self.CUSTOM_TRANSITIONS[("observation", "submit_quality")] = self._validate_submit_quality
+
+    def _validate_submit_quality(self, actor, entity, data, lookup):
+        metrics = {}
+        for field in QUALITY_METRIC_FIELDS:
+            try:
+                metrics[field] = float(data.get(field))
+            except (TypeError, ValueError):
+                raise ValidationError(field + " must be numeric")
+        if not 0.0 <= metrics["cloud_cover_pct"] <= 100.0:
+            raise ValidationError("cloud_cover_pct must be between 0 and 100")
+        for field in ("seeing_arcsec", "tracking_error_arcsec"):
+            if metrics[field] < 0:
+                raise ValidationError(field + " must not be negative")
+        limits = self.quality_limits
+        failures = []
+        if metrics["cloud_cover_pct"] > limits["max_cloud_cover_pct"]:
+            failures.append(
+                "cloud_cover_pct %s exceeds limit %s"
+                % (metrics["cloud_cover_pct"], limits["max_cloud_cover_pct"])
+            )
+        if metrics["seeing_arcsec"] > limits["max_seeing_arcsec"]:
+            failures.append(
+                "seeing_arcsec %s exceeds limit %s"
+                % (metrics["seeing_arcsec"], limits["max_seeing_arcsec"])
+            )
+        if metrics["limiting_magnitude"] < limits["min_limiting_magnitude"]:
+            failures.append(
+                "limiting_magnitude %s is shallower than required %s"
+                % (metrics["limiting_magnitude"], limits["min_limiting_magnitude"])
+            )
+        if metrics["tracking_error_arcsec"] > limits["max_tracking_error_arcsec"]:
+            failures.append(
+                "tracking_error_arcsec %s exceeds limit %s"
+                % (metrics["tracking_error_arcsec"], limits["max_tracking_error_arcsec"])
+            )
+        extra = {
+            "quality": metrics,
+            "quality_limits": dict(limits),
+            "quality_failures": failures,
+            "quality_reviewed_by": actor.user_id,
+            "_next_status": "quality_failed" if failures else "quality_passed",
+        }
+        if not failures:
+            return extra
+        archived = [
+            item
+            for item in (lookup("observation", "candidate_id", entity["data"].get("candidate_id")) if lookup else [])
+            if item["id"] != entity["id"] and item["status"] == "archived"
+        ]
+        if archived:
+            extra["reobservation_suppressed"] = (
+                "candidate already has a qualified archived observation: " + archived[0]["id"]
+            )
+        return extra
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -281,6 +371,8 @@ class RuleEngine:
         self._require(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = self.CUSTOM_TRANSITIONS.get((kind, action))
         extra = custom(actor, entity, data, lookup) if custom else {}
+        if extra and "_next_status" in extra:
+            next_status = extra.pop("_next_status")
         patch = dict(data)
         if extra:
             patch.update(extra)

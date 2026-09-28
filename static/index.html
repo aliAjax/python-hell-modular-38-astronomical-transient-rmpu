@@ -6,28 +6,278 @@
   <title>天文瞬变事件警报与后续观测</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 860px; margin: auto; }
+    main { max-width: 1080px; margin: auto; }
+    section { border: 1px solid #e5e7eb; border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1.5rem; }
+    h1 { font-size: 1.4rem; }
+    h2 { font-size: 1.1rem; margin-top: 0; }
+    table { border-collapse: collapse; width: 100%; font-size: .88rem; margin-top: .75rem; }
+    th, td { border: 1px solid #e5e7eb; padding: .4rem .6rem; text-align: left; vertical-align: top; }
+    th { background: #f9fafb; }
+    input, select { padding: .3rem .45rem; margin: .15rem .3rem .15rem 0; }
+    button { padding: .4rem .8rem; cursor: pointer; }
     pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
-    button { padding: .5rem .8rem; cursor: pointer; }
+    .badge { display: inline-block; padding: .1rem .55rem; border-radius: 999px; font-size: .78rem; background: #e5e7eb; white-space: nowrap; }
+    .badge.passed { background: #dcfce7; color: #15803d; }
+    .badge.failed { background: #fee2e2; color: #b91c1c; }
+    .badge.archived { background: #dbeafe; color: #1d4ed8; }
+    .muted { color: #6b7280; }
+    .error-text { color: #b91c1c; }
   </style>
 </head>
 <body>
 <main>
   <h1>天文瞬变事件警报与后续观测</h1>
-  <p>候选事件、测量合并、望远镜观测申请和审计通过JSON接口管理。</p>
-  <p><button onclick="checkHealth()">检查服务状态</button></p>
-  <pre id="result">等待操作</pre>
-  <pre>GET  /health
-GET  /api/&lt;kind&gt;
+
+  <section>
+    <h2>身份</h2>
+    <label>用户 <input id="userId" value="operator-1"></label>
+    <label>角色
+      <select id="role">
+        <option value="operator" selected>operator（操作员）</option>
+        <option value="coordinator">coordinator（协调员）</option>
+        <option value="supervisor">supervisor（主管）</option>
+        <option value="analyst">analyst（分析员）</option>
+        <option value="admin">admin</option>
+        <option value="viewer">viewer</option>
+      </select>
+    </label>
+    <span class="muted">质量提交需 operator/coordinator，归档需 operator/coordinator/supervisor。</span>
+  </section>
+
+  <section>
+    <h2>质量复核录入</h2>
+    <p class="muted">对已完成的观测提交云量、视宁度、亮限与跟踪偏差。默认阈值：云量 ≤ 30%、视宁度 ≤ 2.5″、亮限 ≥ 18.0 mag、跟踪偏差 ≤ 1.0″。任一项超限则保留原记录并生成带原因的补观测待办；全部合格才允许归档。</p>
+    <p>
+      <select id="completedObs" style="min-width: 22rem"></select>
+      <button onclick="loadCompleted()">刷新已完成观测</button>
+    </p>
+    <p>
+      <label>云量(%) <input id="cloud" type="number" step="0.1" value="10" style="width:6rem"></label>
+      <label>视宁度(″) <input id="seeing" type="number" step="0.1" value="1.5" style="width:6rem"></label>
+      <label>亮限(mag) <input id="limiting" type="number" step="0.1" value="19" style="width:6rem"></label>
+      <label>跟踪偏差(″) <input id="tracking" type="number" step="0.1" value="0.5" style="width:6rem"></label>
+      <button onclick="submitQuality()">提交质量结果</button>
+    </p>
+    <pre id="qualityResult">等待提交</pre>
+  </section>
+
+  <section>
+    <h2>补观测待办</h2>
+    <button onclick="loadTodos()">刷新</button>
+    <span class="muted">状态为“待排程”的观测申请；质量不合格自动生成的补观测会标注超限原因。</span>
+    <table>
+      <thead>
+        <tr><th>ID</th><th>候选</th><th>望远镜 / 队伍</th><th>时间窗</th><th>类型</th><th>原因</th></tr>
+      </thead>
+      <tbody id="todoBody"><tr><td colspan="6" class="muted">尚未加载</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>观测与归档状态</h2>
+    <button onclick="loadObservations()">刷新</button>
+    <span class="muted">复核通过（quality_passed）的观测可执行归档；已归档结果存在时，同一候选的新观测申请会被拒绝。</span>
+    <table>
+      <thead>
+        <tr><th>ID</th><th>候选</th><th>状态</th><th>质量结果</th><th>操作</th></tr>
+      </thead>
+      <tbody id="obsBody"><tr><td colspan="5" class="muted">尚未加载</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>接口</h2>
+    <pre>GET  /health
+GET  /api/&lt;kind&gt;?status=
 POST /api/&lt;kind&gt;
-POST /api/entities/&lt;id&gt;/actions
+POST /api/entities/&lt;id&gt;/actions   (submit_quality / archive / schedule / complete ...)
 GET  /api/audit</pre>
+  </section>
 </main>
 <script>
-async function checkHealth() {
-  const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+const STATUS_LABELS = {
+  requested: "待排程",
+  scheduled: "已排程",
+  completed: "已完成·待复核",
+  quality_passed: "复核通过·待归档",
+  quality_failed: "复核不合格",
+  archived: "已归档",
+  withdrawn: "已撤回",
+};
+
+function esc(value) {
+  return String(value == null ? "" : value)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
+
+function short(id) {
+  return id ? String(id).slice(0, 8) + "…" : "—";
+}
+
+function headers() {
+  return {
+    "Content-Type": "application/json",
+    "X-User-Id": document.getElementById("userId").value || "anonymous",
+    "X-Role": document.getElementById("role").value,
+  };
+}
+
+async function api(path, options) {
+  const response = await fetch(path, Object.assign({ headers: headers() }, options || {}));
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || response.statusText);
+  }
+  return payload;
+}
+
+function statusBadge(status) {
+  let cls = "";
+  if (status === "quality_passed") cls = "passed";
+  if (status === "quality_failed") cls = "failed";
+  if (status === "archived") cls = "archived";
+  return '<span class="badge ' + cls + '">' + esc(STATUS_LABELS[status] || status) + "</span>";
+}
+
+async function loadCompleted() {
+  const select = document.getElementById("completedObs");
+  try {
+    const data = await api("/api/observations?status=completed");
+    select.innerHTML = "";
+    if (!data.items.length) {
+      select.innerHTML = '<option value="">（无待复核的已完成观测）</option>';
+      return;
+    }
+    for (const item of data.items) {
+      const option = document.createElement("option");
+      option.value = item.id;
+      option.textContent = short(item.id) + " 候选 " + short(item.data.candidate_id)
+        + " " + (item.data.start_at || "") + " " + (item.data.mode || "");
+      select.appendChild(option);
+    }
+  } catch (err) {
+    select.innerHTML = '<option value="">加载失败: ' + esc(err.message) + "</option>";
+  }
+}
+
+async function submitQuality() {
+  const id = document.getElementById("completedObs").value;
+  const out = document.getElementById("qualityResult");
+  if (!id) {
+    out.textContent = "请先选择一条已完成观测";
+    return;
+  }
+  const body = {
+    action: "submit_quality",
+    data: {
+      cloud_cover_pct: parseFloat(document.getElementById("cloud").value),
+      seeing_arcsec: parseFloat(document.getElementById("seeing").value),
+      limiting_magnitude: parseFloat(document.getElementById("limiting").value),
+      tracking_error_arcsec: parseFloat(document.getElementById("tracking").value),
+    },
+  };
+  try {
+    const result = await api("/api/entities/" + id + "/actions", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    const failures = (result.data && result.data.quality_failures) || [];
+    const verdict = result.status === "quality_passed"
+      ? "复核通过，可归档"
+      : "复核不合格，原记录已保留并生成补观测待办";
+    out.textContent = verdict
+      + (failures.length ? "\n超限项:\n- " + failures.join("\n- ") : "")
+      + (result.data && result.data.reobservation_suppressed
+        ? "\n注意: " + result.data.reobservation_suppressed + "，未生成补观测待办" : "")
+      + "\n\n" + JSON.stringify(result, null, 2);
+    loadCompleted();
+    loadTodos();
+    loadObservations();
+  } catch (err) {
+    out.textContent = "提交失败: " + err.message;
+  }
+}
+
+async function loadTodos() {
+  const body = document.getElementById("todoBody");
+  try {
+    const data = await api("/api/observations?status=requested");
+    if (!data.items.length) {
+      body.innerHTML = '<tr><td colspan="6" class="muted">暂无待办</td></tr>';
+      return;
+    }
+    body.innerHTML = data.items.map((item) => {
+      const d = item.data || {};
+      const isReobs = !!d.reobservation_of;
+      const reasons = (d.reobservation_reason || []).join("；");
+      return "<tr>"
+        + "<td>" + esc(short(item.id)) + "</td>"
+        + "<td>" + esc(short(d.candidate_id)) + "</td>"
+        + "<td>" + esc(short(d.telescope_id)) + " / " + esc(d.team_id || "—") + "</td>"
+        + "<td>" + esc(d.start_at || "") + " ~ " + esc(d.end_at || "") + "</td>"
+        + "<td>" + (isReobs ? '<span class="badge failed">补观测</span>' : '<span class="badge">常规申请</span>') + "</td>"
+        + "<td>" + (isReobs ? esc(reasons) + "（来源 " + esc(short(d.reobservation_of)) + "）" : "—") + "</td>"
+        + "</tr>";
+    }).join("");
+  } catch (err) {
+    body.innerHTML = '<tr><td colspan="6" class="error-text">加载失败: ' + esc(err.message) + "</td></tr>";
+  }
+}
+
+function qualitySummary(d) {
+  if (!d.quality) return "—";
+  const q = d.quality;
+  let text = "云量 " + q.cloud_cover_pct + "% · 视宁度 " + q.seeing_arcsec
+    + "″ · 亮限 " + q.limiting_magnitude + " mag · 偏差 " + q.tracking_error_arcsec + "″";
+  const failures = d.quality_failures || [];
+  if (failures.length) text += "\n超限: " + failures.join("；");
+  if (d.reobservation_suppressed) text += "\n" + d.reobservation_suppressed;
+  return text;
+}
+
+async function loadObservations() {
+  const body = document.getElementById("obsBody");
+  try {
+    const data = await api("/api/observations");
+    if (!data.items.length) {
+      body.innerHTML = '<tr><td colspan="5" class="muted">暂无观测</td></tr>';
+      return;
+    }
+    body.innerHTML = data.items.map((item) => {
+      const d = item.data || {};
+      const archiveBtn = item.status === "quality_passed"
+        ? '<button onclick="archiveObs(\'' + esc(item.id) + "')\">归档</button>"
+        : "";
+      return "<tr>"
+        + "<td>" + esc(short(item.id)) + "</td>"
+        + "<td>" + esc(short(d.candidate_id)) + "</td>"
+        + "<td>" + statusBadge(item.status) + "</td>"
+        + "<td style=\"white-space:pre-line\">" + esc(qualitySummary(d)) + "</td>"
+        + "<td>" + archiveBtn + "</td>"
+        + "</tr>";
+    }).join("");
+  } catch (err) {
+    body.innerHTML = '<tr><td colspan="5" class="error-text">加载失败: ' + esc(err.message) + "</td></tr>";
+  }
+}
+
+async function archiveObs(id) {
+  try {
+    await api("/api/entities/" + id + "/actions", {
+      method: "POST",
+      body: JSON.stringify({ action: "archive", data: {} }),
+    });
+    loadObservations();
+    loadTodos();
+  } catch (err) {
+    alert("归档失败: " + err.message);
+  }
+}
+
+loadCompleted();
+loadTodos();
+loadObservations();
 </script>
 </body>
 </html>

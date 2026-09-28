@@ -58,7 +58,54 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        if entity["kind"] == "observation" and action == "submit_quality" and updated["status"] == "quality_failed":
+            self._handle_quality_failure(actor, updated)
         return updated
+
+    def _handle_quality_failure(self, actor, observation):
+        suppressed = observation["data"].get("reobservation_suppressed")
+        if suppressed:
+            self.audit.record(
+                observation["id"],
+                actor,
+                "reobservation_suppressed",
+                observation["status"],
+                observation["status"],
+                {"reason": suppressed},
+            )
+            return None
+        reasons = list(observation["data"].get("quality_failures") or [])
+        payload = {
+            "candidate_id": observation["data"].get("candidate_id"),
+            "telescope_id": observation["data"].get("telescope_id"),
+            "team_id": observation["data"].get("team_id"),
+            "mode": observation["data"].get("mode"),
+            "start_at": observation["data"].get("start_at"),
+            "end_at": observation["data"].get("end_at"),
+            "scheduled_team": observation["data"].get("team_id"),
+            "reobservation_of": observation["id"],
+            "reobservation_reason": reasons,
+        }
+        todo = self.repository.create_entity(
+            str(uuid4()),
+            "observation",
+            self.rules.initial_status("observation"),
+            payload,
+            actor.user_id,
+        )
+        self.audit.record(
+            todo["id"],
+            actor,
+            "create",
+            None,
+            todo["status"],
+            {
+                "kind": "observation",
+                "reobservation_of": observation["id"],
+                "reobservation_reason": reasons,
+            },
+        )
+        return todo
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)
